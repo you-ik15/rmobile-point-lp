@@ -1,0 +1,19 @@
+name: Test month replacement
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run replacement and schedule tests
+        run: python3 scripts/test_replace.py

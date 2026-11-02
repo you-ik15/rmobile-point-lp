@@ -1,0 +1,4 @@
+# Keep downloaded HTML byte-for-byte. Git must not rewrite line endings.
+backup/** -text
+site/** -text
+tests/fixtures/** -text

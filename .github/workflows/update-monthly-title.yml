@@ -1,0 +1,207 @@
+name: Update monthly title
+
+# 14:00 UTC = 23:00 JST (Japan has no daylight saving time).
+# GitHub cron cannot express "last day of the month", so this fires on the
+# 28th–31st and the plan step continues only when tomorrow in Asia/Tokyo is the 1st.
+on:
+  schedule:
+    - cron: "0 14 28-31 * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run（true のとき FTP へ送らず、コミットもしない）"
+        type: boolean
+        default: true
+      target_month:
+        description: "対象月 1-12（空欄なら日本時間の翌月）"
+        type: string
+        required: false
+        default: ""
+      remote_path:
+        description: "FTP上の index.html（空欄なら FTP_REMOTE_PATH）"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-monthly-title
+  cancel-in-progress: false
+
+env:
+  FTP_HOST: sv16829.xserver.jp
+  FTP_PORT: "21"
+  FTP_REMOTE_PATH: /rmobile-point.com/public_html/index.html
+  TZ: Asia/Tokyo
+  GIT_TERMINAL_PROMPT: "0"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve month, path, and dry-run
+        id: plan
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          INPUT_TARGET_MONTH: ${{ github.event.inputs.target_month }}
+          INPUT_REMOTE_PATH: ${{ github.event.inputs.remote_path }}
+        run: python3 scripts/plan_run.py
+
+      - name: Download index.html via FTP
+        if: success() && steps.plan.outputs.proceed == 'true'
+        env:
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_PATH: ${{ steps.plan.outputs.remote_path }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          python3 scripts/ftp_io.py download work/original.html
+
+      - name: Save untouched original to backup/
+        if: success() && steps.plan.outputs.proceed == 'true' && steps.plan.outputs.dry_run == 'false'
+        env:
+          STAMP: ${{ steps.plan.outputs.stamp }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          backup_file="backup/index_${STAMP}.html"
+          if git cat-file -e "origin/main:${backup_file}" 2>/dev/null; then
+            echo "::error::同じ時刻のバックアップが既に main にあります: ${backup_file}"
+            exit 1
+          fi
+          mkdir -p backup
+          cp work/original.html "$backup_file"
+          cmp work/original.html "$backup_file"
+
+      - name: Replace the month marker
+        id: replace
+        if: success() && steps.plan.outputs.proceed == 'true'
+        run: |
+          set -euo pipefail
+          set +e
+          python3 scripts/update_month.py \
+            --input work/original.html \
+            --output work/updated.html \
+            --target-month "${TARGET_MONTH}" \
+            --diff work/diff.patch
+          code=$?
+          set -e
+          if [ "$code" -eq 2 ]; then
+            echo "noop=true" >> "$GITHUB_OUTPUT"
+            rm -f "backup/index_${STAMP}.html"
+            {
+              echo "## 変更なし"
+              echo ""
+              echo "すでに【${TARGET_MONTH}月最新】です。アップロードもコミットもしていません。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [ "$code" -ne 0 ]; then
+            exit "$code"
+          fi
+          echo "noop=false" >> "$GITHUB_OUTPUT"
+          fence='```'
+          if grep -q '```' work/diff.patch; then
+            fence='````'
+          fi
+          {
+            echo "## 差分"
+            echo ""
+            echo "${fence}diff"
+            cat work/diff.patch
+            echo "${fence}"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          TARGET_MONTH: ${{ steps.plan.outputs.target_month }}
+          STAMP: ${{ steps.plan.outputs.stamp }}
+
+      - name: Upload dry-run files
+        if: success() && steps.plan.outputs.proceed == 'true' && steps.replace.outputs.noop != 'true' && steps.plan.outputs.dry_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: monthly-title-dry-run-${{ steps.plan.outputs.stamp }}
+          path: |
+            work/original.html
+            work/updated.html
+            work/diff.patch
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload pre-upload backup artifact
+        if: success() && steps.plan.outputs.proceed == 'true' && steps.replace.outputs.noop != 'true' && steps.plan.outputs.dry_run == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-before-upload-${{ steps.plan.outputs.stamp }}
+          path: backup/index_${{ steps.plan.outputs.stamp }}.html
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload updated index.html via FTP
+        if: success() && steps.plan.outputs.proceed == 'true' && steps.replace.outputs.noop != 'true' && steps.plan.outputs.dry_run == 'false'
+        env:
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_PATH: ${{ steps.plan.outputs.remote_path }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ftp_io.py upload work/updated.html
+
+      - name: Re-download and verify
+        if: success() && steps.plan.outputs.proceed == 'true' && steps.replace.outputs.noop != 'true' && steps.plan.outputs.dry_run == 'false'
+        env:
+          FTP_USERNAME: ${{ secrets.FTP_USERNAME }}
+          FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
+          FTP_REMOTE_PATH: ${{ steps.plan.outputs.remote_path }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ftp_io.py verify work/updated.html
+
+      - name: Commit backup and updated copy to main
+        if: success() && steps.plan.outputs.proceed == 'true' && steps.replace.outputs.noop != 'true' && steps.plan.outputs.dry_run == 'false'
+        env:
+          STAMP: ${{ steps.plan.outputs.stamp }}
+          TARGET_MONTH: ${{ steps.plan.outputs.target_month }}
+        run: |
+          set -euo pipefail
+          # checkout が作業ツリーを入れ替えても、取得した原本と更新後のバイト列は残す。
+          original_copy="$(mktemp)"
+          updated_copy="$(mktemp)"
+          cp work/original.html "$original_copy"
+          cp work/updated.html "$updated_copy"
+          git fetch origin main
+          git checkout -B main origin/main
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.autocrlf false
+          mkdir -p backup site
+          backup_file="backup/index_${STAMP}.html"
+          if git cat-file -e "HEAD:${backup_file}" 2>/dev/null; then
+            echo "::error::同じ時刻のバックアップが既に main にあります: ${backup_file}"
+            exit 1
+          fi
+          cp "$original_copy" "$backup_file"
+          cp "$updated_copy" site/index.html
+          cmp "$original_copy" "$backup_file"
+          cmp "$updated_copy" site/index.html
+          git add -- "$backup_file" site/index.html
+          git commit -m "月次タイトルを【${TARGET_MONTH}月最新】に更新" \
+            -m "更新前の index.html を ${backup_file} に保存し、site/index.html を更新後の内容にした。"
+          git push origin HEAD:main
+          {
+            echo "## 反映しました"
+            echo ""
+            echo "- バックアップ: \`${backup_file}\`"
+            echo "- 更新後のコピー: \`site/index.html\`"
+            echo "- 対象: 【${TARGET_MONTH}月最新】"
+          } >> "$GITHUB_STEP_SUMMARY"
